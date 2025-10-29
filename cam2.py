@@ -38,7 +38,7 @@ class LoadingDialog(QDialog):
             logo_label.setPixmap(pixmap.scaled(400, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         logo_label.setAlignment(Qt.AlignCenter)
 
-        self.message_label = QLabel("Запуск приложения...")
+        self.message_label = QLabel("Starting application...")
         self.message_label.setAlignment(Qt.AlignCenter)
         self.message_label.setWordWrap(True)
         self.message_label.setStyleSheet("font-size: 14px;")
@@ -293,7 +293,7 @@ class CameraApp(QMainWindow):
         self.is_switching_mode = False
 
         # Setup settings path
-        self.update_loading(5, "Подготовка настроек...")
+        self.update_loading(5, "Preparing settings...")
         if platform.system() == 'Windows':
             app_data = os.environ.get('LOCALAPPDATA', os.path.expanduser('~'))
             settings_dir = Path(app_data) / 'ELPCameraControl'
@@ -305,15 +305,15 @@ class CameraApp(QMainWindow):
         print(f"Settings file location: {self.settings_file}")
 
         # Load settings
-        self.update_loading(15, "Загрузка сохранённых настроек...")
+        self.update_loading(15, "Loading saved settings...")
         self.settings = self.load_settings()
 
         # Check video save path
-        self.update_loading(30, "Проверка пути сохранения видео...")
+        self.update_loading(30, "Checking video save path...")
         self.video_save_path = self.check_video_save_path()
 
         # Find camera
-        self.update_loading(55, "Поиск камеры...")
+        self.update_loading(55, "Searching for camera...")
         self.camera_index = self.load_or_find_camera()
 
         # Exit if no camera found
@@ -324,11 +324,11 @@ class CameraApp(QMainWindow):
                                "Please check that the camera is connected and try again.")
             sys.exit(1)
 
-        self.update_loading(75, "Загрузка интерфейса...")
+        self.update_loading(75, "Loading interface...")
         self.init_ui()
 
         # Initialize and start camera thread AFTER UI is ready
-        self.update_loading(90, "Инициализация камеры...")
+        self.update_loading(90, "Initializing camera...")
         self.init_camera_thread()
         self.finish_loading()
         
@@ -377,7 +377,7 @@ class CameraApp(QMainWindow):
 
     def finish_loading(self):
         if self.loading_dialog:
-            self.loading_dialog.update_progress(100, "Готово")
+            self.loading_dialog.update_progress(100, "Done")
             self.loading_dialog.close()
             self.loading_dialog = None
         
@@ -404,42 +404,53 @@ class CameraApp(QMainWindow):
             print(f"Using saved video path: {video_path}")
             return video_path
         
-        # Ask user for path if not set
-        msg = QMessageBox()
-        msg.setWindowTitle("Select Video Save Location")
-        msg.setText("Please select a folder where videos will be saved.")
-        msg.setInformativeText("You can change this later in the settings.")
-        msg.setStandardButtons(QMessageBox.Ok)
-        msg.exec_()
-        
-        default_path = str(Path.home() / 'Videos')
-        folder = QFileDialog.getExistingDirectory(
-            None,
-            "Select Video Save Folder",
-            default_path,
-            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
-        )
-        
-        if folder:
-            video_path = str(Path(folder) / 'ELPCameraRecordings')
-            Path(video_path).mkdir(parents=True, exist_ok=True)
-            
-            self.settings['video_save_path'] = video_path
-            self.save_settings()
-            
-            print(f"Video save path set to: {video_path}")
-            return video_path
-        else:
-            # Use default path if user cancels
-            default_video_path = str(Path.home() / 'Videos' / 'ELPCameraRecordings')
-            Path(default_video_path).mkdir(parents=True, exist_ok=True)
-            
-            self.settings['video_save_path'] = default_video_path
-            self.save_settings()
-            
-            QMessageBox.information(None, "Default Path",
-                                  f"Videos will be saved to:\n{default_video_path}")
-            return default_video_path
+        loading_was_visible = False
+        try:
+            if self.loading_dialog and self.loading_dialog.isVisible():
+                self.loading_dialog.hide()
+                QApplication.processEvents()
+                loading_was_visible = True
+
+            # Ask user for path if not set
+            msg = QMessageBox()
+            msg.setWindowTitle("Select Video Save Location")
+            msg.setText("Please select a folder where videos will be saved.")
+            msg.setInformativeText("You can change this later in the settings.")
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.exec_()
+
+            default_path = str(Path.home() / 'Videos')
+            folder = QFileDialog.getExistingDirectory(
+                None,
+                "Select Video Save Folder",
+                default_path,
+                QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+            )
+
+            if folder:
+                video_path = str(Path(folder) / 'ELPCameraRecordings')
+                Path(video_path).mkdir(parents=True, exist_ok=True)
+
+                self.settings['video_save_path'] = video_path
+                self.save_settings()
+
+                print(f"Video save path set to: {video_path}")
+                return video_path
+            else:
+                # Use default path if user cancels
+                default_video_path = str(Path.home() / 'Videos' / 'ELPCameraRecordings')
+                Path(default_video_path).mkdir(parents=True, exist_ok=True)
+
+                self.settings['video_save_path'] = default_video_path
+                self.save_settings()
+
+                QMessageBox.information(None, "Default Path",
+                                      f"Videos will be saved to:\n{default_video_path}")
+                return default_video_path
+        finally:
+            if loading_was_visible and self.loading_dialog:
+                self.loading_dialog.show()
+                QApplication.processEvents()
     
     def load_or_find_camera(self):
         """Load saved camera index or find new one"""
