@@ -3,7 +3,8 @@ import cv2
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QPushButton, QLabel, QComboBox,
-                            QMessageBox, QGroupBox, QProgressBar, QFileDialog)
+                            QMessageBox, QGroupBox, QProgressBar, QFileDialog,
+                            QDialog)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMutex, QMutexLocker
 from PyQt5.QtGui import QImage, QPixmap, QFont
 import time
@@ -16,6 +17,49 @@ from pathlib import Path
 
 # Suppress OpenCV warnings
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+
+class LoadingDialog(QDialog):
+    """Simple dialog that shows application loading progress."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ELP Camera Control")
+        self.setWindowFlags((self.windowFlags() | Qt.WindowStaysOnTopHint | Qt.CustomizeWindowHint) & ~Qt.WindowContextHelpButtonHint)
+        self.setModal(False)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+
+        logo_label = QLabel()
+        logo_path = Path(__file__).resolve().parent / 'logo.png'
+        if logo_path.exists():
+            pixmap = QPixmap(str(logo_path))
+            logo_label.setPixmap(pixmap.scaled(400, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        logo_label.setAlignment(Qt.AlignCenter)
+
+        self.message_label = QLabel("Запуск приложения...")
+        self.message_label.setAlignment(Qt.AlignCenter)
+        self.message_label.setWordWrap(True)
+        self.message_label.setStyleSheet("font-size: 14px;")
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+
+        layout.addWidget(logo_label)
+        layout.addWidget(self.message_label)
+        layout.addWidget(self.progress_bar)
+
+        self.setFixedSize(420, 520)
+
+    def update_progress(self, value, message=None):
+        self.progress_bar.setValue(value)
+        if message:
+            self.message_label.setText(message)
+        QApplication.processEvents()
+
 
 class UnifiedCameraThread(QThread):
     """Single thread for both preview and recording"""
@@ -241,43 +285,52 @@ class UnifiedCameraThread(QThread):
         self.wait()
 
 class CameraApp(QMainWindow):
-    def __init__(self):
+    def __init__(self, loading_dialog=None):
         super().__init__()
+        self.loading_dialog = loading_dialog
         self.unified_thread = None
         self.is_recording = False
         self.is_switching_mode = False
-        
+
         # Setup settings path
+        self.update_loading(5, "Подготовка настроек...")
         if platform.system() == 'Windows':
             app_data = os.environ.get('LOCALAPPDATA', os.path.expanduser('~'))
             settings_dir = Path(app_data) / 'ELPCameraControl'
         else:
             settings_dir = Path.home() / '.config' / 'ELPCameraControl'
-        
+
         settings_dir.mkdir(parents=True, exist_ok=True)
         self.settings_file = str(settings_dir / 'camera_settings.json')
         print(f"Settings file location: {self.settings_file}")
-        
+
         # Load settings
+        self.update_loading(15, "Загрузка сохранённых настроек...")
         self.settings = self.load_settings()
-        
+
         # Check video save path
+        self.update_loading(30, "Проверка пути сохранения видео...")
         self.video_save_path = self.check_video_save_path()
-        
+
         # Find camera
+        self.update_loading(55, "Поиск камеры...")
         self.camera_index = self.load_or_find_camera()
-        
+
         # Exit if no camera found
         if self.camera_index == -1:
+            self.finish_loading()
             QMessageBox.critical(None, "Camera Error",
                                "ELP camera not found!\n\n"
                                "Please check that the camera is connected and try again.")
             sys.exit(1)
-        
+
+        self.update_loading(75, "Загрузка интерфейса...")
         self.init_ui()
-        
+
         # Initialize and start camera thread AFTER UI is ready
+        self.update_loading(90, "Инициализация камеры...")
         self.init_camera_thread()
+        self.finish_loading()
         
     def init_camera_thread(self):
         """Initialize camera thread with current settings"""
@@ -317,6 +370,16 @@ class CameraApp(QMainWindow):
         
         # Start thread
         self.unified_thread.start()
+
+    def update_loading(self, value, message):
+        if self.loading_dialog:
+            self.loading_dialog.update_progress(value, message)
+
+    def finish_loading(self):
+        if self.loading_dialog:
+            self.loading_dialog.update_progress(100, "Готово")
+            self.loading_dialog.close()
+            self.loading_dialog = None
         
     def load_settings(self):
         """Load settings from file"""
@@ -884,7 +947,11 @@ class CameraApp(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    camera_app = CameraApp()
+    loading_dialog = LoadingDialog()
+    loading_dialog.show()
+    app.processEvents()
+
+    camera_app = CameraApp(loading_dialog)
     camera_app.show()
     sys.exit(app.exec_())
 
