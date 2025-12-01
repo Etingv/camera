@@ -87,6 +87,13 @@ class UnifiedCameraThread(QThread):
         self.start_time = 0
         self.ffmpeg_process = None
         self.preview_frame_size = 0
+        self.read_timer = None
+        self.health_timer = None
+        self.restart_timer = None
+        self.stdout_buffer = bytearray()
+        self.stderr_buffer = bytearray()
+        self.last_frame_time = 0.0
+        self.restart_attempts = 0
 
     def set_camera_mode(self, resolution, fps):
         with QMutexLocker(self.mutex):
@@ -195,7 +202,14 @@ class UnifiedCameraThread(QThread):
         else:
             output_params += ['-f', 'null', '-']
 
-        cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error']
+        cmd = [
+            'ffmpeg',
+            '-y',
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-fflags', 'nobuffer',
+            '-flush_packets', '1',
+        ]
         cmd += input_params
         cmd += ['-filter_complex', filter_complex]
         cmd += ['-r', str(self.current_fps)]
@@ -206,8 +220,16 @@ class UnifiedCameraThread(QThread):
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=self.preview_frame_size * 2
+                bufsize=self.preview_frame_size
             )
+            if self.ffmpeg_process.stdout:
+                os.set_blocking(self.ffmpeg_process.stdout.fileno(), False)
+            if self.ffmpeg_process.stderr:
+                os.set_blocking(self.ffmpeg_process.stderr.fileno(), False)
+            self.stdout_buffer.clear()
+            self.stderr_buffer.clear()
+            self.last_frame_time = time.time()
+            self.restart_attempts = 0
             self.cameraReinitialized.emit()
             return True
         except Exception as exc:
@@ -217,49 +239,142 @@ class UnifiedCameraThread(QThread):
 
     def run(self):
         self.is_running = True
-        consecutive_failures = 0
+        self.read_timer = QTimer()
+        self.read_timer.timeout.connect(self.read_frame_nonblocking)
+        self.health_timer = QTimer()
+        self.health_timer.setInterval(200)
+        self.health_timer.timeout.connect(self.check_process_health)
+        self.restart_timer = QTimer()
+        self.restart_timer.setSingleShot(True)
+        self.restart_timer.setInterval(500)
+        self.restart_timer.timeout.connect(self.restart_ffmpeg_process)
 
-        while self.is_running:
+        self.start_ffmpeg_process()
+        if self.read_timer:
+            self.read_timer.start(0)
+        if self.health_timer:
+            self.health_timer.start()
+
+        self.exec()
+
+        if self.read_timer:
+            self.read_timer.stop()
+        if self.health_timer:
+            self.health_timer.stop()
+        if self.restart_timer:
+            self.restart_timer.stop()
+        self.stop_ffmpeg_process()
+
+    def read_frame_nonblocking(self):
+        if not self.ffmpeg_process or not self.ffmpeg_process.stdout:
+            return
+
+        preview_width = max(1, int(self.current_resolution[0] * self.preview_scale))
+        preview_height = max(1, int(self.current_resolution[1] * self.preview_scale))
+        target_size = self.preview_frame_size
+        frames_processed = 0
+
+        while frames_processed < 3:
             try:
-                with QMutexLocker(self.mutex):
-                    needs_restart = self.needs_restart
-                    self.needs_restart = False
+                chunk = self.ffmpeg_process.stdout.read(target_size - len(self.stdout_buffer))
+            except BlockingIOError:
+                break
 
-                if self.ffmpeg_process is None or needs_restart:
-                    if not self.start_ffmpeg_process():
-                        self.connectionLost.emit()
-                        time.sleep(1)
-                        continue
+            if not chunk:
+                break
 
-                if self.ffmpeg_process.stdout is None:
-                    time.sleep(0.01)
-                    continue
+            self.stdout_buffer.extend(chunk)
+            if len(self.stdout_buffer) < target_size:
+                continue
 
-                frame_bytes = self.ffmpeg_process.stdout.read(self.preview_frame_size)
-                if len(frame_bytes) != self.preview_frame_size:
-                    consecutive_failures += 1
-                    if consecutive_failures > 5:
-                        self.connectionLost.emit()
-                        self.needs_restart = True
-                    time.sleep(0.05)
-                    continue
+            frame_bytes = bytes(self.stdout_buffer[:target_size])
+            del self.stdout_buffer[:target_size]
+            frames_processed += 1
+            self.last_frame_time = time.time()
 
-                consecutive_failures = 0
-                preview_width = max(1, int(self.current_resolution[0] * self.preview_scale))
-                preview_height = max(1, int(self.current_resolution[1] * self.preview_scale))
+            try:
                 frame = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((preview_height, preview_width, 3))
                 self.frameReady.emit(frame)
+            except Exception as exc:
+                print(f"Failed to decode frame: {exc}")
+                continue
 
-                if self.is_recording:
-                    self.frames_captured += 1
-                    self.framesCaptured.emit(self.frames_captured)
-                    duration = time.time() - self.start_time
-                    self.recordingProgress.emit(f"Recording... {duration:.1f}s")
-            except Exception as e:
-                print(f"Thread error: {e}")
-                time.sleep(0.05)
+            if self.is_recording:
+                self.frames_captured += 1
+                self.framesCaptured.emit(self.frames_captured)
+                duration = time.time() - self.start_time
+                self.recordingProgress.emit(f"Recording... {duration:.1f}s")
 
+    def check_process_health(self):
+        with QMutexLocker(self.mutex):
+            needs_restart = self.needs_restart
+            self.needs_restart = False
+
+        if needs_restart:
+            self.restart_ffmpeg_process()
+            return
+
+        if not self.ffmpeg_process:
+            self.restart_ffmpeg_process()
+            return
+
+        if self.ffmpeg_process.poll() is not None:
+            self.handle_process_failure(self.ffmpeg_process.returncode)
+            self.restart_ffmpeg_process()
+            return
+
+        if self.last_frame_time and (time.time() - self.last_frame_time) > 1.0:
+            self.handle_process_failure(None, reason="No preview frames received")
+            self.restart_ffmpeg_process()
+
+    def handle_process_failure(self, exit_code, reason=None):
+        stderr_output = self.drain_stderr()
+        message = reason or "ffmpeg process issue"
+        if exit_code is not None:
+            message += f" (exit code {exit_code})"
+        if stderr_output:
+            message += f"\n{stderr_output.strip().splitlines()[-1]}"
+        if self.is_recording:
+            self.recordingError.emit(message)
+        else:
+            print(message)
+
+    def drain_stderr(self):
+        if not self.ffmpeg_process or not self.ffmpeg_process.stderr:
+            return ""
+
+        collected = False
+        while True:
+            try:
+                data = self.ffmpeg_process.stderr.read1(1024)
+            except (BlockingIOError, AttributeError):
+                data = None
+
+            if not data:
+                break
+            collected = True
+            self.stderr_buffer.extend(data)
+            if len(self.stderr_buffer) > 4096:
+                self.stderr_buffer = self.stderr_buffer[-4096:]
+
+        if collected:
+            try:
+                return self.stderr_buffer.decode(errors='ignore')
+            except Exception:
+                return ""
+        return ""
+
+    def restart_ffmpeg_process(self):
         self.stop_ffmpeg_process()
+        if not self.is_running:
+            return
+        if not self.start_ffmpeg_process():
+            self.restart_attempts += 1
+            if self.restart_attempts > 3:
+                self.connectionLost.emit()
+                return
+            if self.restart_timer:
+                self.restart_timer.start()
 
     def start_recording(self):
         with QMutexLocker(self.mutex):
@@ -380,6 +495,13 @@ class UnifiedCameraThread(QThread):
     def stop(self):
         self.stop_recording()
         self.is_running = False
+        if self.read_timer:
+            self.read_timer.stop()
+        if self.health_timer:
+            self.health_timer.stop()
+        if self.restart_timer:
+            self.restart_timer.stop()
+        self.quit()
         self.stop_ffmpeg_process()
         self.wait()
 
@@ -393,6 +515,10 @@ class UnifiedCameraThread(QThread):
                     self.ffmpeg_process.kill()
                 except Exception:
                     pass
+            if self.ffmpeg_process.stdout:
+                self.ffmpeg_process.stdout.close()
+            if self.ffmpeg_process.stderr:
+                self.ffmpeg_process.stderr.close()
             self.ffmpeg_process = None
 
 
