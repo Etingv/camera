@@ -62,7 +62,7 @@ class UnifiedCameraThread(QThread):
     frameReady = Signal(np.ndarray)
     connectionLost = Signal()
     recordingStarted = Signal()
-    recordingStopped = Signal(str)
+    recordingStopped = Signal(dict)
     framesCaptured = Signal(int)
     recordingProgress = Signal(str)
     recordingError = Signal(str)
@@ -280,14 +280,97 @@ class UnifiedCameraThread(QThread):
 
             duration = time.time() - self.start_time
 
+            self.stop_ffmpeg_process()
+
             if self.frames_captured > 0:
-                self.recordingStopped.emit(f"{self.recording_filename} (duration: {duration:.1f} sec)")
+                metadata = self.process_recording(duration)
+                self.recordingStopped.emit(metadata)
             else:
                 try:
                     os.remove(self.recording_filename)
-                except:
+                except Exception:
                     pass
-                self.recordingStopped.emit("")
+                self.recordingStopped.emit({})
+
+    def process_recording(self, duration):
+        metadata = {
+            "original_path": self.recording_filename,
+            "duration": duration,
+            "frames_captured": self.frames_captured,
+            "resolution": f"{self.current_resolution[0]}x{self.current_resolution[1]}",
+            "target_fps": self.current_fps,
+            "real_fps": None,
+            "renamed_path": None,
+            "timestamp": datetime.fromtimestamp(self.start_time).strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+
+        ffprobe_cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_streams",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "stream=r_frame_rate,duration",
+            self.recording_filename,
+        ]
+
+        ffprobe_output = ""
+        try:
+            result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
+            ffprobe_output = result.stdout
+        except Exception as exc:
+            print(f"Failed to run ffprobe: {exc}")
+
+        rate_value = None
+        duration_value = duration
+
+        for line in ffprobe_output.splitlines():
+            if line.startswith("r_frame_rate="):
+                try:
+                    rate_str = line.split("=", 1)[1].strip()
+                    if "/" in rate_str:
+                        num, denom = rate_str.split("/", 1)
+                        rate_value = float(num) / float(denom) if float(denom) != 0 else None
+                    else:
+                        rate_value = float(rate_str)
+                except Exception:
+                    rate_value = None
+            elif line.startswith("duration="):
+                try:
+                    duration_value = float(line.split("=", 1)[1].strip())
+                except Exception:
+                    duration_value = duration
+
+        real_fps = None
+        if duration_value and duration_value > 0 and self.frames_captured:
+            real_fps = self.frames_captured / duration_value
+        elif rate_value:
+            real_fps = rate_value
+
+        if real_fps is None:
+            real_fps = float(self.current_fps)
+
+        metadata["real_fps"] = real_fps
+
+        original_path = Path(self.recording_filename)
+        timestamp_str = datetime.fromtimestamp(self.start_time).strftime("%Y%m%d_%H%M%S")
+        real_fps_str = f"{real_fps:.2f}".rstrip("0").rstrip(".")
+        new_name = f"recording_{timestamp_str}_{metadata['resolution']}_{real_fps_str}fps{original_path.suffix}"
+        new_path = original_path.with_name(new_name)
+
+        try:
+            original_path.rename(new_path)
+            metadata["renamed_path"] = str(new_path)
+            sidecar_path = new_path.with_suffix(new_path.suffix + ".json")
+            with open(sidecar_path, "w") as sidecar_file:
+                json.dump(metadata, sidecar_file, indent=2)
+        except Exception as exc:
+            print(f"Failed to finalize recording file: {exc}")
+            metadata["renamed_path"] = str(original_path)
+
+        return metadata
 
     def stop(self):
         self.stop_recording()
@@ -369,6 +452,19 @@ class CameraApp(QMainWindow):
     def save_settings(self):
         with open(self.settings_file, 'w') as f:
             json.dump(self.settings, f, indent=2)
+
+    def add_recording_history(self, metadata):
+        history = self.settings.get('recording_history', [])
+        history_entry = {
+            'path': metadata.get('renamed_path') or metadata.get('original_path'),
+            'duration': metadata.get('duration'),
+            'real_fps': metadata.get('real_fps'),
+            'resolution': metadata.get('resolution'),
+            'timestamp': metadata.get('timestamp'),
+        }
+        history.insert(0, history_entry)
+        self.settings['recording_history'] = history[:20]
+        self.save_settings()
 
     def check_video_save_path(self):
         video_path = self.settings.get('video_save_path', '')
@@ -846,7 +942,7 @@ class CameraApp(QMainWindow):
         self.recording_progress.setVisible(True)
         self.recording_progress.setRange(0, 0)
 
-    def on_recording_stopped(self, filename):
+    def on_recording_stopped(self, metadata):
         self.is_recording = False
         self.record_button.setText("Start Recording")
         self.record_button.setStyleSheet("""
@@ -869,8 +965,20 @@ class CameraApp(QMainWindow):
         self.ready_indicator.setStyleSheet("color: green; font-size: 24px;")
         self.recording_progress.setVisible(False)
 
-        if filename:
-            QMessageBox.information(self, "Recording completed", f"Video saved:\n{filename}")
+        if metadata:
+            path = metadata.get('renamed_path') or metadata.get('original_path')
+            duration = metadata.get('duration')
+            real_fps = metadata.get('real_fps')
+            resolution = metadata.get('resolution')
+            info_message = (
+                f"Video saved: {path}\n"
+                f"Resolution: {resolution}\n"
+                f"Duration: {duration:.2f} sec\n"
+                f"Real FPS: {real_fps:.2f}"
+            )
+            self.status_label.setText(f"Status: Saved {resolution}, {duration:.2f}s @ {real_fps:.2f} fps")
+            self.add_recording_history(metadata)
+            QMessageBox.information(self, "Recording completed", info_message)
 
     def update_frames_count(self, count):
         self.frames_label.setText(f"Frames recorded: {count}")
