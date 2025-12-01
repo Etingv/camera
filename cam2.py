@@ -639,7 +639,7 @@ class CameraApp(QMainWindow):
 
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_FPS, 260)
 
             w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
@@ -647,7 +647,7 @@ class CameraApp(QMainWindow):
             fps = cap.get(cv2.CAP_PROP_FPS)
             cap.release()
 
-            return w == 640 and h == 360 and fps >= 200
+            return w == 640 and h == 480 and fps >= 200
         except:
             return False
 
@@ -662,14 +662,14 @@ class CameraApp(QMainWindow):
 
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 cap.set(cv2.CAP_PROP_FPS, 260)
 
                 w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
                 h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
                 fps = cap.get(cv2.CAP_PROP_FPS)
 
-                if w == 640 and h == 360 and fps >= 200:
+                if w == 640 and h == 480 and fps >= 200:
                     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
                     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
                     cap.set(cv2.CAP_PROP_FPS, 60)
@@ -697,7 +697,6 @@ class CameraApp(QMainWindow):
         resolution = self.resolution_combo.currentData()
         fps = int(self.fps_combo.currentText())
         preset = self.preview_presets.get(self.preview_combo.currentText(), self.preview_presets["Medium"])
-
         self.unified_thread.current_resolution = resolution
         self.unified_thread.current_fps = fps
         self.unified_thread.set_recording_params(self.codec_combo.currentData(), self.video_save_path)
@@ -713,10 +712,7 @@ class CameraApp(QMainWindow):
         self.unified_thread.recordingError.connect(self.on_recording_error)
         self.unified_thread.cameraReinitialized.connect(self.on_camera_reinitialized)
 
-        preview_resolution = (max(1, int(resolution[0] * preset["scale"])), max(1, int(resolution[1] * preset["scale"])))
-        resolution_str = f"{resolution[0]}x{resolution[1]}"
-        preview_str = f"{preview_resolution[0]}x{preview_resolution[1]}"
-        self.info_label.setText(f"Preview mode: {preview_str} @ {preset['fps']}fps (source {resolution_str} @ {fps}fps)")
+        self.update_preview_info()
         self.path_label.setText(self.video_save_path)
 
         self.ready_indicator.setStyleSheet("color: green; font-size: 24px;")
@@ -773,10 +769,10 @@ class CameraApp(QMainWindow):
         control_layout.addWidget(resolution_label)
 
         self.resolution_combo = QComboBox()
-        self.resolution_combo.addItem("640×360", (640, 360))
+        self.resolution_combo.addItem("640×480", (640, 480))
         self.resolution_combo.addItem("1280×720", (1280, 720))
         self.resolution_combo.addItem("1920×1080", (1920, 1080))
-        self.resolution_combo.setCurrentIndex(1)
+        self.resolution_combo.setCurrentIndex(0)
         self.resolution_combo.setStyleSheet("font-size: 16px; padding: 5px;")
         self.resolution_combo.currentIndexChanged.connect(self.on_resolution_changed)
         control_layout.addWidget(self.resolution_combo)
@@ -786,7 +782,7 @@ class CameraApp(QMainWindow):
         control_layout.addWidget(fps_label)
 
         self.fps_combo = QComboBox()
-        self.fps_combo.addItems(["60", "120"])
+        self.fps_combo.addItems(["60", "120", "260"])
         self.fps_combo.setCurrentText("120")
         self.fps_combo.setStyleSheet("font-size: 16px; padding: 5px;")
         self.fps_combo.currentIndexChanged.connect(self.on_fps_changed)
@@ -870,7 +866,7 @@ class CameraApp(QMainWindow):
         status_layout.addWidget(self.camera_label)
         info_layout.addLayout(status_layout)
 
-        self.info_label = QLabel("Preview mode: 1280x720 @ 120fps")
+        self.info_label = QLabel("")
         self.info_label.setStyleSheet("font-size: 16px;")
         info_layout.addWidget(self.info_label)
 
@@ -910,14 +906,34 @@ class CameraApp(QMainWindow):
         self.blink_timer.timeout.connect(self.blink_indicator)
         self.blink_state = True
 
+        # Initialize informational label to match default controls
+        self.update_preview_info()
+
     def rotate_preview(self):
         """Поворот превью на 90 градусов по часовой стрелке"""
         self.rotation_angle = (self.rotation_angle + 90) % 360
         if self.unified_thread:
             self.unified_thread.set_rotation(self.rotation_angle)
 
+    def calculate_preview_info(self):
+        resolution = self.resolution_combo.currentData()
+        fps = int(self.fps_combo.currentText())
+        preset = self.preview_presets.get(self.preview_combo.currentText(), self.preview_presets["Medium"])
+        preview_resolution = (
+            max(1, int(resolution[0] * preset["scale"])),
+            max(1, int(resolution[1] * preset["scale"]))
+        )
+        return resolution, fps, preset, preview_resolution
+
+    def update_preview_info(self):
+        resolution, fps, preset, preview_resolution = self.calculate_preview_info()
+        resolution_str = f"{resolution[0]}x{resolution[1]}"
+        preview_str = f"{preview_resolution[0]}x{preview_resolution[1]}"
+        self.info_label.setText(f"Preview mode: {preview_str} @ {preset['fps']}fps (source {resolution_str} @ {fps}fps)")
+
     def on_preview_changed(self, index):
         if not self.unified_thread:
+            self.update_preview_info()
             return
         preset_name = self.preview_combo.currentText()
         preset = self.preview_presets.get(preset_name, self.preview_presets["Medium"])
@@ -932,6 +948,7 @@ class CameraApp(QMainWindow):
 
     def on_resolution_changed(self, index):
         if not self.unified_thread or self.is_recording:
+            self.update_preview_info()
             return
 
         resolution = self.resolution_combo.currentData()
@@ -940,7 +957,7 @@ class CameraApp(QMainWindow):
         self.fps_combo.blockSignals(True)
         self.fps_combo.clear()
 
-        if resolution == (640, 360):
+        if resolution == (640, 480):
             self.fps_combo.addItems(["60", "120", "260"])
         elif resolution == (1280, 720):
             self.fps_combo.addItems(["60", "120"])
@@ -965,14 +982,8 @@ class CameraApp(QMainWindow):
         if self.is_recording or self.is_switching_mode or not self.unified_thread:
             return
 
-        resolution = self.resolution_combo.currentData()
-        fps = int(self.fps_combo.currentText())
-        preset = self.preview_presets.get(self.preview_combo.currentText(), self.preview_presets["Medium"])
-        preview_resolution = (max(1, int(resolution[0] * preset["scale"])), max(1, int(resolution[1] * preset["scale"])))
-
-        resolution_str = f"{resolution[0]}x{resolution[1]}"
-        preview_str = f"{preview_resolution[0]}x{preview_resolution[1]}"
-        self.info_label.setText(f"Preview mode: {preview_str} @ {preset['fps']}fps (source {resolution_str} @ {fps}fps)")
+        resolution, fps, preset, _ = self.calculate_preview_info()
+        self.update_preview_info()
 
         self.set_controls_enabled(False)
         self.video_label.setText("Switching camera mode...")
