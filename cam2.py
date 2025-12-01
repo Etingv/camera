@@ -639,7 +639,7 @@ class CameraApp(QMainWindow):
 
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_FPS, 260)
 
             w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
@@ -647,7 +647,7 @@ class CameraApp(QMainWindow):
             fps = cap.get(cv2.CAP_PROP_FPS)
             cap.release()
 
-            return w == 640 and h == 360 and fps >= 200
+            return w == 640 and h == 480 and fps >= 200
         except:
             return False
 
@@ -662,14 +662,14 @@ class CameraApp(QMainWindow):
 
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 cap.set(cv2.CAP_PROP_FPS, 260)
 
                 w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
                 h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
                 fps = cap.get(cv2.CAP_PROP_FPS)
 
-                if w == 640 and h == 360 and fps >= 200:
+                if w == 640 and h == 480 and fps >= 200:
                     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
                     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
                     cap.set(cv2.CAP_PROP_FPS, 60)
@@ -773,7 +773,7 @@ class CameraApp(QMainWindow):
         control_layout.addWidget(resolution_label)
 
         self.resolution_combo = QComboBox()
-        self.resolution_combo.addItem("640×360", (640, 360))
+        self.resolution_combo.addItem("640×480", (640, 480))
         self.resolution_combo.addItem("1280×720", (1280, 720))
         self.resolution_combo.addItem("1920×1080", (1920, 1080))
         self.resolution_combo.setCurrentIndex(1)
@@ -940,7 +940,7 @@ class CameraApp(QMainWindow):
         self.fps_combo.blockSignals(True)
         self.fps_combo.clear()
 
-        if resolution == (640, 360):
+        if resolution == (640, 480):
             self.fps_combo.addItems(["60", "120", "260"])
         elif resolution == (1280, 720):
             self.fps_combo.addItems(["60", "120"])
