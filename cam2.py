@@ -125,32 +125,37 @@ class UnifiedCameraThread(QThread):
         return ['-f', 'v4l2', '-video_size', f'{width}x{height}', '-framerate', str(fps), '-i', f'/dev/video{self.camera_index}']
 
     def build_filter_complex(self, preview_width, preview_height):
-        transpose_filter = ''
+        rotate_filter = ''
         rotate_metadata = None
         if self.rotation_angle == 90:
-            transpose_filter = 'transpose=1'
+            rotate_filter = 'transpose=1'
             rotate_metadata = '90'
         elif self.rotation_angle == 180:
-            transpose_filter = 'transpose=1,transpose=1'
+            rotate_filter = 'hflip,vflip'
             rotate_metadata = '180'
         elif self.rotation_angle == 270:
-            transpose_filter = 'transpose=2'
+            rotate_filter = 'transpose=2'
             rotate_metadata = '270'
 
         preview_filters = []
-        record_filters = []
-        if transpose_filter:
-            preview_filters.append(transpose_filter)
-            record_filters.append(transpose_filter)
+        record_chain = None
+        if rotate_filter:
+            preview_filters.append(rotate_filter)
+            if self.is_recording and self.codec != 'copy':
+                record_chain = rotate_filter
 
         preview_filters.append(f'fps={int(self.preview_fps)}')
         preview_filters.append(f'scale={preview_width}:{preview_height}')
 
-        preview_chain = ','.join(preview_filters) if preview_filters else 'null'
-        record_chain = ','.join(record_filters) if record_filters else 'null'
+        filter_parts = [f"[0:v]{','.join(preview_filters)}[preview]"]
 
-        filter_parts = [f"[0:v]{preview_chain}[preview]", f"[0:v]{record_chain}[record]"]
-        return ';'.join(filter_parts), rotate_metadata
+        record_map = '0:v'
+        if record_chain:
+            filter_parts.append(f"[0:v]{record_chain}[record]")
+            record_map = '[record]'
+
+        filter_complex = ';'.join(filter_parts)
+        return filter_complex, rotate_metadata, record_map
 
     def build_recording_params(self):
         if self.codec == 'copy':
@@ -170,7 +175,7 @@ class UnifiedCameraThread(QThread):
         self.preview_frame_size = preview_width * preview_height * 3
 
         input_params = self.build_input_params()
-        filter_complex, rotate_meta = self.build_filter_complex(preview_width, preview_height)
+        filter_complex, rotate_meta, record_map = self.build_filter_complex(preview_width, preview_height)
 
         videos_dir = Path(self.video_save_path)
         videos_dir.mkdir(parents=True, exist_ok=True)
@@ -182,7 +187,7 @@ class UnifiedCameraThread(QThread):
         recording_params = self.build_recording_params()
 
         output_params = ['-map', '[preview]', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']
-        output_params += ['-map', '[record]'] + recording_params
+        output_params += ['-map', record_map] + recording_params
         if rotate_meta:
             output_params += ['-metadata:s:v', f'rotate={rotate_meta}']
         if self.is_recording:
