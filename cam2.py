@@ -772,7 +772,7 @@ class CameraApp(QMainWindow):
         self.resolution_combo.addItem("640×480", (640, 480))
         self.resolution_combo.addItem("1280×720", (1280, 720))
         self.resolution_combo.addItem("1920×1080", (1920, 1080))
-        self.resolution_combo.setCurrentIndex(0)
+        self.resolution_combo.setCurrentIndex(1)
         self.resolution_combo.setStyleSheet("font-size: 16px; padding: 5px;")
         self.resolution_combo.currentIndexChanged.connect(self.on_resolution_changed)
         control_layout.addWidget(self.resolution_combo)
