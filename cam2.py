@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import concurrent.futures
+import subprocess
 
 # Suppress OpenCV warnings
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
@@ -69,107 +70,191 @@ class UnifiedCameraThread(QThread):
 
     def __init__(self):
         super().__init__()
-        self.cap = None
         self.is_running = False
         self.is_recording = False
-        self.needs_reinit = False
+        self.needs_restart = False
         self.camera_index = 0
         self.mutex = QMutex()
         self.current_resolution = (1280, 720)
         self.current_fps = 120
-        self.codec = "XVID"
+        self.preview_scale = 0.75
+        self.preview_fps = 30
+        self.rotation_angle = 0
+        self.codec = "copy"
         self.video_save_path = ""
-        self.out = None
         self.frames_captured = 0
         self.recording_filename = ""
         self.start_time = 0
+        self.ffmpeg_process = None
+        self.preview_frame_size = 0
 
     def set_camera_mode(self, resolution, fps):
         with QMutexLocker(self.mutex):
             if resolution != self.current_resolution or fps != self.current_fps:
                 self.current_resolution = resolution
                 self.current_fps = fps
-                self.needs_reinit = True
+                self.needs_restart = True
 
     def set_recording_params(self, codec, save_path):
         with QMutexLocker(self.mutex):
             self.codec = codec
             self.video_save_path = save_path
 
-    def initialize_camera(self):
+    def set_preview_quality(self, scale, fps):
+        with QMutexLocker(self.mutex):
+            if scale != self.preview_scale or fps != self.preview_fps:
+                self.preview_scale = scale
+                self.preview_fps = fps
+                self.needs_restart = True
+
+    def set_rotation(self, angle):
+        with QMutexLocker(self.mutex):
+            if angle != self.rotation_angle:
+                self.rotation_angle = angle
+                self.needs_restart = True
+
+    def build_input_params(self):
+        width, height = self.current_resolution
+        fps = self.current_fps
+        system = platform.system()
+        if system == 'Windows':
+            device = f"video={self.camera_index}"
+            return ['-f', 'dshow', '-video_size', f'{width}x{height}', '-framerate', str(fps), '-i', device]
+        if system == 'Darwin':
+            return ['-f', 'avfoundation', '-video_size', f'{width}x{height}', '-framerate', str(fps), '-i', f"{self.camera_index}:none"]
+        return ['-f', 'v4l2', '-video_size', f'{width}x{height}', '-framerate', str(fps), '-i', f'/dev/video{self.camera_index}']
+
+    def build_filter_complex(self, preview_width, preview_height):
+        transpose_filter = ''
+        rotate_metadata = None
+        if self.rotation_angle == 90:
+            transpose_filter = 'transpose=1'
+            rotate_metadata = '90'
+        elif self.rotation_angle == 180:
+            transpose_filter = 'transpose=1,transpose=1'
+            rotate_metadata = '180'
+        elif self.rotation_angle == 270:
+            transpose_filter = 'transpose=2'
+            rotate_metadata = '270'
+
+        preview_filters = []
+        record_filters = []
+        if transpose_filter:
+            preview_filters.append(transpose_filter)
+            record_filters.append(transpose_filter)
+
+        preview_filters.append(f'fps={int(self.preview_fps)}')
+        preview_filters.append(f'scale={preview_width}:{preview_height}')
+
+        preview_chain = ','.join(preview_filters) if preview_filters else 'null'
+        record_chain = ','.join(record_filters) if record_filters else 'null'
+
+        filter_parts = [f"[0:v]{preview_chain}[preview]", f"[0:v]{record_chain}[record]"]
+        return ';'.join(filter_parts), rotate_metadata
+
+    def build_recording_params(self):
+        if self.codec == 'copy':
+            return ['-c', 'copy']
+        if self.codec == 'h264_nvenc':
+            return ['-c:v', 'h264_nvenc', '-preset', 'fast']
+        if self.codec == 'libx264':
+            return ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18']
+        return ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18']
+
+    def start_ffmpeg_process(self):
+        self.stop_ffmpeg_process()
+
+        width, height = self.current_resolution
+        preview_width = max(1, int(width * self.preview_scale))
+        preview_height = max(1, int(height * self.preview_scale))
+        self.preview_frame_size = preview_width * preview_height * 3
+
+        input_params = self.build_input_params()
+        filter_complex, rotate_meta = self.build_filter_complex(preview_width, preview_height)
+
+        videos_dir = Path(self.video_save_path)
+        videos_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        resolution_str = f"{width}x{height}"
+        self.recording_filename = str(videos_dir / f"recording_{timestamp}_{resolution_str}_{self.current_fps}fps_{self.codec}.mp4")
+
+        recording_params = self.build_recording_params()
+
+        output_params = ['-map', '[preview]', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']
+        output_params += ['-map', '[record]'] + recording_params
+        if rotate_meta:
+            output_params += ['-metadata:s:v', f'rotate={rotate_meta}']
+        if self.is_recording:
+            output_params += [self.recording_filename]
+        else:
+            output_params += ['-f', 'null', '-']
+
+        cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error']
+        cmd += input_params
+        cmd += ['-filter_complex', filter_complex]
+        cmd += ['-r', str(self.current_fps)]
+        cmd += output_params
+
         try:
-            if self.cap is not None:
-                self.cap.release()
-                self.cap = None
-            time.sleep(0.2)
-
-            backend = cv2.CAP_DSHOW if platform.system() == 'Windows' else cv2.CAP_ANY
-            self.cap = cv2.VideoCapture(self.camera_index, backend)
-
-            if not self.cap.isOpened():
-                return False
-
-            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.current_resolution[0])
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.current_resolution[1])
-            self.cap.set(cv2.CAP_PROP_FPS, self.current_fps)
-
-            ret, frame = self.cap.read()
-            if not ret:
-                return False
-
+            self.ffmpeg_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=self.preview_frame_size * 2
+            )
             self.cameraReinitialized.emit()
             return True
-        except Exception as e:
-            print(f"Camera init error: {e}")
+        except Exception as exc:
+            print(f"Failed to start ffmpeg: {exc}")
+            self.ffmpeg_process = None
             return False
 
     def run(self):
-        if not self.initialize_camera():
-            self.connectionLost.emit()
-            return
-
         self.is_running = True
         consecutive_failures = 0
 
         while self.is_running:
             try:
                 with QMutexLocker(self.mutex):
-                    if self.needs_reinit and not self.is_recording:
-                        self.needs_reinit = False
-                        if not self.initialize_camera():
-                            self.connectionLost.emit()
-                            break
-                        consecutive_failures = 0
+                    needs_restart = self.needs_restart
+                    self.needs_restart = False
+
+                if self.ffmpeg_process is None or needs_restart:
+                    if not self.start_ffmpeg_process():
+                        self.connectionLost.emit()
+                        time.sleep(1)
                         continue
 
-                if self.cap and self.cap.isOpened():
-                    ret, frame = self.cap.read()
-                    if ret and frame is not None:
-                        consecutive_failures = 0
-                        self.frameReady.emit(frame)
+                if self.ffmpeg_process.stdout is None:
+                    time.sleep(0.01)
+                    continue
 
-                        with QMutexLocker(self.mutex):
-                            if self.is_recording and self.out:
-                                self.out.write(frame)
-                                self.frames_captured += 1
-                                self.framesCaptured.emit(self.frames_captured)
-                    else:
-                        consecutive_failures += 1
-                        if consecutive_failures > 10:
-                            self.connectionLost.emit()
-                            break
-                    time.sleep(0.01)
-                else:
-                    time.sleep(0.01)
+                frame_bytes = self.ffmpeg_process.stdout.read(self.preview_frame_size)
+                if len(frame_bytes) != self.preview_frame_size:
+                    consecutive_failures += 1
+                    if consecutive_failures > 5:
+                        self.connectionLost.emit()
+                        self.needs_restart = True
+                    time.sleep(0.05)
+                    continue
+
+                consecutive_failures = 0
+                preview_width = max(1, int(self.current_resolution[0] * self.preview_scale))
+                preview_height = max(1, int(self.current_resolution[1] * self.preview_scale))
+                frame = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((preview_height, preview_width, 3))
+                self.frameReady.emit(frame)
+
+                if self.is_recording:
+                    self.frames_captured += 1
+                    self.framesCaptured.emit(self.frames_captured)
+                    duration = time.time() - self.start_time
+                    self.recordingProgress.emit(f"Recording... {duration:.1f}s")
             except Exception as e:
                 print(f"Thread error: {e}")
-                time.sleep(0.01)
+                time.sleep(0.05)
 
-        if self.cap:
-            self.cap.release()
-        if self.out:
-            self.out.release()
+        self.stop_ffmpeg_process()
 
     def start_recording(self):
         with QMutexLocker(self.mutex):
@@ -178,21 +263,10 @@ class UnifiedCameraThread(QThread):
 
             videos_dir = Path(self.video_save_path)
             videos_dir.mkdir(parents=True, exist_ok=True)
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            resolution_str = f"{self.current_resolution[0]}x{self.current_resolution[1]}"
-            self.recording_filename = str(videos_dir / f"recording_{timestamp}_{resolution_str}_{self.current_fps}fps_{self.codec}.avi")
-
-            fourcc = cv2.VideoWriter_fourcc(*self.codec)
-            self.out = cv2.VideoWriter(self.recording_filename, fourcc, self.current_fps, self.current_resolution)
-
-            if not self.out.isOpened():
-                self.recordingError.emit("Failed to initialize video writer")
-                return
-
             self.frames_captured = 0
             self.start_time = time.time()
             self.is_recording = True
+            self.needs_restart = True
             self.recordingStarted.emit()
             self.recordingProgress.emit("Recording started")
 
@@ -202,9 +276,7 @@ class UnifiedCameraThread(QThread):
                 return
 
             self.is_recording = False
-            if self.out:
-                self.out.release()
-                self.out = None
+            self.needs_restart = True
 
             duration = time.time() - self.start_time
 
@@ -220,10 +292,20 @@ class UnifiedCameraThread(QThread):
     def stop(self):
         self.stop_recording()
         self.is_running = False
-        if self.cap:
-            self.cap.release()
-            self.cap = None
+        self.stop_ffmpeg_process()
         self.wait()
+
+    def stop_ffmpeg_process(self):
+        if self.ffmpeg_process:
+            try:
+                self.ffmpeg_process.terminate()
+                self.ffmpeg_process.wait(timeout=1)
+            except Exception:
+                try:
+                    self.ffmpeg_process.kill()
+                except Exception:
+                    pass
+            self.ffmpeg_process = None
 
 
 class CameraApp(QMainWindow):
@@ -234,6 +316,11 @@ class CameraApp(QMainWindow):
         self.is_recording = False
         self.is_switching_mode = False
         self.rotation_angle = 0  # 0, 90, 180, 270
+        self.preview_presets = {
+            "High": {"scale": 1.0, "fps": 60},
+            "Medium": {"scale": 0.75, "fps": 30},
+            "Low": {"scale": 0.5, "fps": 15},
+        }
 
         self.update_loading(5, "Preparing settings...")
         self.settings_dir = self.get_settings_dir()
@@ -382,10 +469,13 @@ class CameraApp(QMainWindow):
 
         resolution = self.resolution_combo.currentData()
         fps = int(self.fps_combo.currentText())
+        preset = self.preview_presets.get(self.preview_combo.currentText(), self.preview_presets["Medium"])
 
         self.unified_thread.current_resolution = resolution
         self.unified_thread.current_fps = fps
         self.unified_thread.set_recording_params(self.codec_combo.currentData(), self.video_save_path)
+        self.unified_thread.set_preview_quality(preset["scale"], preset["fps"])
+        self.unified_thread.set_rotation(self.rotation_angle)
 
         self.unified_thread.frameReady.connect(self.update_frame)
         self.unified_thread.connectionLost.connect(self.on_camera_connection_lost)
@@ -396,8 +486,10 @@ class CameraApp(QMainWindow):
         self.unified_thread.recordingError.connect(self.on_recording_error)
         self.unified_thread.cameraReinitialized.connect(self.on_camera_reinitialized)
 
+        preview_resolution = (max(1, int(resolution[0] * preset["scale"])), max(1, int(resolution[1] * preset["scale"])))
         resolution_str = f"{resolution[0]}x{resolution[1]}"
-        self.info_label.setText(f"Preview mode: {resolution_str} @ {fps}fps")
+        preview_str = f"{preview_resolution[0]}x{preview_resolution[1]}"
+        self.info_label.setText(f"Preview mode: {preview_str} @ {preset['fps']}fps (source {resolution_str} @ {fps}fps)")
         self.path_label.setText(self.video_save_path)
 
         self.ready_indicator.setStyleSheet("color: green; font-size: 24px;")
@@ -475,6 +567,19 @@ class CameraApp(QMainWindow):
 
         control_layout.addStretch()
 
+        preset_label = QLabel("Preview:")
+        preset_label.setStyleSheet("font-size: 16px;")
+        control_layout.addWidget(preset_label)
+
+        self.preview_combo = QComboBox()
+        self.preview_combo.addItems(list(self.preview_presets.keys()))
+        self.preview_combo.setCurrentText("Medium")
+        self.preview_combo.setStyleSheet("font-size: 16px; padding: 5px;")
+        self.preview_combo.currentIndexChanged.connect(self.on_preview_changed)
+        control_layout.addWidget(self.preview_combo)
+
+        control_layout.addStretch()
+
         # Кнопка поворота превью
         self.rotate_button = QPushButton("⟳ Rotate")
         self.rotate_button.setStyleSheet("font-size: 14px; padding: 5px;")
@@ -488,9 +593,10 @@ class CameraApp(QMainWindow):
         control_layout.addWidget(codec_label)
 
         self.codec_combo = QComboBox()
-        self.codec_combo.addItem("XVID (compressed, small size)", "XVID")
-        self.codec_combo.addItem("MJPG (no transcoding)", "MJPG")
-        self.codec_combo.setCurrentIndex(0)
+        self.codec_combo.addItem("Copy (passthrough)", "copy")
+        self.codec_combo.addItem("NVENC (h264_nvenc)", "h264_nvenc")
+        self.codec_combo.addItem("CPU (libx264)", "libx264")
+        self.codec_combo.setCurrentIndex(1)
         self.codec_combo.setStyleSheet("font-size: 16px; padding: 5px;")
         control_layout.addWidget(self.codec_combo)
 
@@ -580,6 +686,16 @@ class CameraApp(QMainWindow):
     def rotate_preview(self):
         """Поворот превью на 90 градусов по часовой стрелке"""
         self.rotation_angle = (self.rotation_angle + 90) % 360
+        if self.unified_thread:
+            self.unified_thread.set_rotation(self.rotation_angle)
+
+    def on_preview_changed(self, index):
+        if not self.unified_thread:
+            return
+        preset_name = self.preview_combo.currentText()
+        preset = self.preview_presets.get(preset_name, self.preview_presets["Medium"])
+        self.unified_thread.set_preview_quality(preset["scale"], preset["fps"])
+        self.apply_camera_mode()
 
     def closeEvent(self, event):
         if self.unified_thread:
@@ -624,15 +740,19 @@ class CameraApp(QMainWindow):
 
         resolution = self.resolution_combo.currentData()
         fps = int(self.fps_combo.currentText())
+        preset = self.preview_presets.get(self.preview_combo.currentText(), self.preview_presets["Medium"])
+        preview_resolution = (max(1, int(resolution[0] * preset["scale"])), max(1, int(resolution[1] * preset["scale"])))
 
         resolution_str = f"{resolution[0]}x{resolution[1]}"
-        self.info_label.setText(f"Preview mode: {resolution_str} @ {fps}fps")
+        preview_str = f"{preview_resolution[0]}x{preview_resolution[1]}"
+        self.info_label.setText(f"Preview mode: {preview_str} @ {preset['fps']}fps (source {resolution_str} @ {fps}fps)")
 
         self.set_controls_enabled(False)
         self.video_label.setText("Switching camera mode...")
         self.is_switching_mode = True
 
         self.unified_thread.set_camera_mode(resolution, fps)
+        self.unified_thread.set_preview_quality(preset["scale"], preset["fps"])
 
     def on_camera_reinitialized(self):
         self.is_switching_mode = False
@@ -642,6 +762,7 @@ class CameraApp(QMainWindow):
         self.resolution_combo.setEnabled(enabled and not self.is_recording)
         self.fps_combo.setEnabled(enabled and not self.is_recording)
         self.codec_combo.setEnabled(enabled and not self.is_recording)
+        self.preview_combo.setEnabled(enabled and not self.is_recording)
         self.record_button.setEnabled(enabled)
         self.change_path_button.setEnabled(enabled and not self.is_recording)
 
@@ -677,14 +798,6 @@ class CameraApp(QMainWindow):
 
     def update_frame(self, frame):
         if not self.is_switching_mode:
-            # Применяем поворот к кадру для превью
-            if self.rotation_angle == 90:
-                frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-            elif self.rotation_angle == 180:
-                frame = cv2.rotate(frame, cv2.ROTATE_180)
-            elif self.rotation_angle == 270:
-                frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-            
             height, width, channel = frame.shape
             bytes_per_line = 3 * width
             q_image = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888).rgbSwapped()
